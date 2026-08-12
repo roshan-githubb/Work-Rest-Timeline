@@ -1,8 +1,9 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { BLOCKS_PER_DAY, blockWallClock, strokeRange } from '@/lib/timeline';
 import TimelineLane from './TimelineLane';
+import { LABEL_COLUMN } from './layout';
 
 export default function TimelineGrid({
   blocks,
@@ -15,54 +16,63 @@ export default function TimelineGrid({
   const columnsRef = useRef(null);
   const isDragging = stroke !== null;
 
-  function columnAt(clientX) {
+  const columnAt = useCallback((clientX, { clamp }) => {
     const rect = columnsRef.current?.getBoundingClientRect();
-    if (!rect) return null;
+    if (!rect || rect.width === 0) return null;
 
-    const ratio = (clientX - rect.left) / rect.width;
-    const index = Math.floor(ratio * BLOCKS_PER_DAY);
+    // A press on the lane label, or off the end of the graph, is not a column —
+    // but once a drag is under way we keep painting to whichever edge it left.
+    if (!clamp && (clientX < rect.left || clientX > rect.right)) return null;
+
+    const index = Math.floor(((clientX - rect.left) / rect.width) * BLOCKS_PER_DAY);
     return Math.min(BLOCKS_PER_DAY - 1, Math.max(0, index));
-  }
+  }, []);
 
   function handlePointerDown(event) {
+    // Mouse: left button only. Touch and pen report button 0 as well.
     if (event.button !== 0) return;
 
-    const index = columnAt(event.clientX);
+    const index = columnAt(event.clientX, { clamp: false });
     if (index === null) return;
 
     event.preventDefault();
     onStrokeStart(index);
   }
 
-  function handlePointerMove(event) {
-    if (!isDragging) return;
-
-    const index = columnAt(event.clientX);
-    if (index !== null && index !== stroke.head) onStrokeMove(index);
-  }
-
   useEffect(() => {
     if (!isDragging) return;
 
+    // Tracked on the window so a drag survives leaving the graph, and so a
+    // finger that slides onto another day's lanes still paints this one.
+    const move = (event) => {
+      const index = columnAt(event.clientX, { clamp: true });
+      if (index !== null) onStrokeMove(index);
+    };
     const end = () => onStrokeEnd();
-    const cancel = (event) => {
+    const cancel = () => onStrokeCancel();
+    const key = (event) => {
       if (event.key === 'Escape') onStrokeCancel();
     };
 
+    window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', end);
-    window.addEventListener('keydown', cancel);
+    window.addEventListener('pointercancel', cancel);
+    window.addEventListener('keydown', key);
 
     return () => {
+      window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', end);
-      window.removeEventListener('keydown', cancel);
+      window.removeEventListener('pointercancel', cancel);
+      window.removeEventListener('keydown', key);
     };
-  }, [isDragging, onStrokeEnd, onStrokeCancel]);
+  }, [isDragging, columnAt, onStrokeMove, onStrokeEnd, onStrokeCancel]);
 
   return (
     <div
       onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      className={`min-w-[720px] touch-none select-none ${isDragging ? 'cursor-col-resize' : ''}`}
+      // pan-y, not none: a sideways drag paints, an up-and-down swipe still
+      // scrolls the page past the other days.
+      className={`touch-pan-y select-none ${isDragging ? 'cursor-col-resize' : ''}`}
     >
       <StrokeTimes stroke={stroke} />
       <HourRuler />
@@ -81,7 +91,7 @@ function StrokeTimes({ stroke }) {
 
   return (
     <div className="flex h-5 items-end">
-      <div className="w-16 shrink-0" />
+      <div className={LABEL_COLUMN} />
       <div className="relative flex-1">
         {ends.map((index) => (
           <span
@@ -122,7 +132,7 @@ function HourRuler() {
 
   return (
     <div className="flex items-end pb-1">
-      <div className="w-16 shrink-0" />
+      <div className={LABEL_COLUMN} />
       <div className="relative h-4 flex-1">
         <span className="absolute bottom-0 left-0">
           <Moon />
@@ -137,7 +147,11 @@ function HourRuler() {
             <span
               key={hour}
               style={{ left: `${(hour / 24) * 100}%` }}
-              className="absolute bottom-0 -translate-x-1/2 text-[10px] leading-none text-slate-500 tabular-nums"
+              // Every hour has room on a laptop; on a phone only every third
+              // one does, so the rest step aside rather than overlap.
+              className={`absolute bottom-0 -translate-x-1/2 text-[10px] leading-none text-slate-500 tabular-nums ${
+                hour % 3 === 0 ? '' : 'hidden sm:inline'
+              }`}
             >
               {String(hour).padStart(2, '0')}
             </span>
