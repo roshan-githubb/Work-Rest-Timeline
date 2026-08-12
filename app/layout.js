@@ -16,6 +16,13 @@ export const metadata = {
   description: "A driver's work and rest periods across a 24-hour day.",
 };
 
+export const viewport = {
+  width: "device-width",
+  initialScale: 1,
+  // The graph is drawn on, so a stray double-tap should not zoom the page away.
+  maximumScale: 5,
+};
+
 export default function RootLayout({ children }) {
   return (
     <html

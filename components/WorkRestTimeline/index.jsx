@@ -2,97 +2,184 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  DAY,
+  DEFAULT_RANGE,
   DRIVER_ID,
-  DRIVER_NAME,
-  LICENCE_NUMBER,
+  MAX_RANGE_DAYS,
+  QUICK_FILTERS,
   RULESETS,
-  TIMEZONE_LABEL,
+  dayFor,
 } from '@/lib/config';
+import {
+  countDays,
+  datesInRange,
+  isISODate,
+  normaliseRange,
+  rangeEndingAt,
+} from '@/lib/dates';
 import {
   applyStroke,
   beginStroke,
   blocksToChanges,
   changesToBlocks,
   createEmptyDay,
-  formatDuration,
-  summarise,
+  sameBlocks,
 } from '@/lib/timeline';
-import TimelineGrid from './TimelineGrid';
+import TimelineDay from './TimelineDay';
+
+// One shared instance, never written to, so a day that is missing does not hand
+// out a fresh array on every render and defeat TimelineDay's memoisation.
+const EMPTY_DAY = createEmptyDay();
 
 export default function WorkRestTimeline() {
-  const [blocks, setBlocks] = useState(createEmptyDay);
-  const [savedBlocks, setSavedBlocks] = useState(createEmptyDay);
+  const [range, setRange] = useState(DEFAULT_RANGE);
+  const [days, setDays] = useState({});
+  const [saved, setSaved] = useState({});
+  const [rulesets, setRulesets] = useState({});
   const [stroke, setStroke] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [loadedRange, setLoadedRange] = useState(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
-  const [ruleset, setRuleset] = useState(RULESETS[0]);
 
-  const blocksRef = useRef(blocks);
+  const daysRef = useRef(days);
   const strokeRef = useRef(stroke);
   useEffect(() => {
-    blocksRef.current = blocks;
+    daysRef.current = days;
     strokeRef.current = stroke;
   });
 
+  const dates = useMemo(() => datesInRange(range.from, range.to), [range]);
+
+  // Loading is what the range being on screen looks like before its days have
+  // arrived, so it is read off the two rather than tracked on its own.
+  const loading =
+    loadedRange?.from !== range.from || loadedRange?.to !== range.to;
+
   useEffect(() => {
+    let cancelled = false;
+
     async function load() {
       try {
         const response = await fetch(
-          `/api/timeline?driverId=${DRIVER_ID}&date=${DAY.date}`,
+          `/api/timeline?driverId=${DRIVER_ID}&from=${range.from}&to=${range.to}`,
         );
+        if (!response.ok) throw new Error('Load failed');
+
         const data = await response.json();
-        const loaded = changesToBlocks(data.changes, DAY);
-        setBlocks(loaded);
-        setSavedBlocks(loaded);
+        if (cancelled) return;
+
+        const loaded = {};
+        for (const day of data.days) {
+          loaded[day.date] = changesToBlocks(day.changes, dayFor(day.date));
+        }
+
+        setSaved((previous) => ({ ...previous, ...loaded }));
+        setDays((previous) => {
+          const next = { ...previous };
+          for (const [date, blocks] of Object.entries(loaded)) {
+            // Widening the range reloads days already on screen; anything the
+            // reader has edited but not saved stays as they left it.
+            const edited = previous[date] && !sameBlocks(previous[date], blocks);
+            if (!edited) next[date] = blocks;
+          }
+          return next;
+        });
       } catch {
-        setMessage('Could not load this day');
+        if (!cancelled) setMessage('Could not load these days');
       } finally {
-        setLoading(false);
+        // Marked as loaded either way: a range that failed should show the
+        // problem, not sit on "Loading…" for ever.
+        if (!cancelled) setLoadedRange(range);
       }
     }
-    load();
-  }, []);
 
-  const handleStrokeStart = useCallback((index) => {
-    setStroke(beginStroke(blocksRef.current, index));
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [range]);
+
+  const blocksFor = useCallback((date) => days[date] ?? EMPTY_DAY, [days]);
+
+  const handleStrokeStart = useCallback((date, index) => {
+    const blocks = daysRef.current[date] ?? EMPTY_DAY;
+    setStroke({ date, ...beginStroke(blocks, index) });
     setMessage('');
   }, []);
 
   const handleStrokeMove = useCallback((index) => {
-    setStroke((current) => (current ? { ...current, head: index } : current));
+    setStroke((current) =>
+      !current || current.head === index ? current : { ...current, head: index },
+    );
   }, []);
 
   const handleStrokeEnd = useCallback(() => {
     const current = strokeRef.current;
     if (!current) return;
+
     setStroke(null);
-    setBlocks((blocks) => applyStroke(blocks, current));
+    setDays((previous) => ({
+      ...previous,
+      [current.date]: applyStroke(previous[current.date] ?? EMPTY_DAY, current),
+    }));
   }, []);
 
   const handleStrokeCancel = useCallback(() => setStroke(null), []);
 
-  const isDirty = useMemo(
-    () => blocks.some((block, index) => block !== savedBlocks[index]),
-    [blocks, savedBlocks],
+  const handleRulesetChange = useCallback((date, value) => {
+    setRulesets((previous) => ({ ...previous, [date]: value }));
+  }, []);
+
+  const dirtyDates = useMemo(
+    () => dates.filter((date) => saved[date] && !sameBlocks(blocksFor(date), saved[date])),
+    [dates, saved, blocksFor],
   );
 
+  function moveRange(edge, value) {
+    if (!isISODate(value)) return;
+
+    const next = normaliseRange(
+      { ...range, [edge]: value },
+      { maxDays: MAX_RANGE_DAYS, moved: edge },
+    );
+    if (!next) return;
+
+    setRange(next);
+    setMessage('');
+  }
+
+  // The last day stays where it is and the range grows backwards from it.
+  function applyQuickFilter(length) {
+    setRange(rangeEndingAt(range.to, length));
+    setMessage('');
+  }
+
   async function handleSave() {
-    const pending = blocks;
+    const pending = dirtyDates.map((date) => ({ date, blocks: blocksFor(date) }));
+    if (pending.length === 0) return;
+
     setSaving(true);
     setMessage('');
 
     try {
-      const changes = blocksToChanges(pending, DAY);
       const response = await fetch('/api/timeline', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ driverId: DRIVER_ID, date: DAY.date, changes }),
+        body: JSON.stringify({
+          driverId: DRIVER_ID,
+          days: pending.map(({ date, blocks }) => ({
+            date,
+            changes: blocksToChanges(blocks, dayFor(date)),
+          })),
+        }),
       });
       if (!response.ok) throw new Error('Save failed');
-      setSavedBlocks(pending);
-      setMessage('Saved');
+
+      setSaved((previous) => {
+        const next = { ...previous };
+        for (const { date, blocks } of pending) next[date] = blocks;
+        return next;
+      });
+      setMessage(pending.length === 1 ? 'Saved 1 day' : `Saved ${pending.length} days`);
     } catch {
       setMessage('Could not save');
     } finally {
@@ -101,111 +188,123 @@ export default function WorkRestTimeline() {
   }
 
   function handleReset() {
-    setBlocks(savedBlocks);
+    setDays((previous) => {
+      const next = { ...previous };
+      for (const date of dirtyDates) next[date] = saved[date];
+      return next;
+    });
     setMessage('');
   }
 
-  const shown = useMemo(() => applyStroke(blocks, stroke), [blocks, stroke]);
-  const totals = useMemo(() => summarise(shown), [shown]);
-
-  if (loading) {
-    return <p className="p-6 text-sm text-slate-500">Loading…</p>;
-  }
+  const isDirty = dirtyDates.length > 0;
+  const spanLength = countDays(range.from, range.to);
 
   return (
-    <section className="overflow-hidden rounded-lg border border-slate-300 bg-white">
-      <header className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 bg-[#eef1f8] px-4 py-3">
-        <div className="flex flex-wrap items-center gap-x-10 gap-y-3 text-sm">
-          <Field label="Driver" value={DRIVER_NAME} />
+    <section>
+      <div className="sticky top-0 z-10 -mx-4 mb-5 border-b border-slate-200 bg-white/95 px-4 py-3 backdrop-blur sm:mx-0 sm:rounded-lg sm:border sm:border-slate-300 sm:px-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-2">
+              <label className="min-w-0 flex-1 sm:flex-none">
+                <span className="sr-only">From date</span>
+                <input
+                  type="date"
+                  value={range.from}
+                  onChange={(event) => moveRange('from', event.target.value)}
+                  className="w-full rounded-sm border border-slate-300 bg-white px-2 py-1.5 text-sm sm:w-40"
+                />
+              </label>
 
-          <label className="flex flex-col gap-1">
-            <span className="sr-only">Ruleset</span>
-            <select
-              value={ruleset}
-              onChange={(event) => setRuleset(event.target.value)}
-              className="w-56 rounded-sm border border-slate-300 bg-white px-2 py-1.5 text-sm"
-            >
-              {RULESETS.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
+              <span aria-hidden="true" className="text-slate-400">
+                –
+              </span>
+
+              <label className="min-w-0 flex-1 sm:flex-none">
+                <span className="sr-only">To date</span>
+                <input
+                  type="date"
+                  value={range.to}
+                  onChange={(event) => moveRange('to', event.target.value)}
+                  className="w-full rounded-sm border border-slate-300 bg-white px-2 py-1.5 text-sm sm:w-40"
+                />
+              </label>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-x-1 gap-y-1 text-xs text-slate-500">
+              <span className="mr-1">Quick Filter:</span>
+              {QUICK_FILTERS.map((length, index) => (
+                <span key={length} className="flex items-center gap-1">
+                  {index > 0 ? <span className="text-slate-300">|</span> : null}
+                  <button
+                    type="button"
+                    onClick={() => applyQuickFilter(length)}
+                    aria-pressed={spanLength === length}
+                    className={`rounded-sm px-1.5 py-0.5 hover:bg-slate-100 ${
+                      spanLength === length
+                        ? 'bg-slate-100 font-semibold text-slate-900'
+                        : 'text-sky-700'
+                    }`}
+                  >
+                    {length} days
+                  </button>
+                </span>
               ))}
-            </select>
-          </label>
-
-          <Field label="Time Zone" value={TIMEZONE_LABEL} />
-          <Field label="Licence Number" value={LICENCE_NUMBER} />
-        </div>
-
-        <div className="flex items-center gap-3">
-          {message ? (
-            <span className="text-sm text-slate-600">{message}</span>
-          ) : isDirty ? (
-            <span className="text-sm text-amber-700">Unsaved changes</span>
-          ) : null}
-
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={saving || !isDirty}
-            className="rounded-sm bg-slate-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {saving ? 'Saving…' : 'Save'}
-          </button>
-
-          <button
-            type="button"
-            onClick={handleReset}
-            disabled={saving || !isDirty}
-            className="rounded-sm border border-slate-300 px-4 py-1.5 text-sm font-medium hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            Reset
-          </button>
-        </div>
-      </header>
-
-      <div className="overflow-x-auto p-4">
-        <div className="flex items-start">
-          <div className="min-w-0 flex-1">
-            <TimelineGrid
-              blocks={shown}
-              stroke={stroke}
-              onStrokeStart={handleStrokeStart}
-              onStrokeMove={handleStrokeMove}
-              onStrokeEnd={handleStrokeEnd}
-              onStrokeCancel={handleStrokeCancel}
-            />
+            </div>
           </div>
 
-          <div className="mt-9 w-28 shrink-0 border-y border-r border-slate-300">
-            <Total label="Total Work" value={formatDuration(totals.workMinutes)} />
-            <Total label="Total Rest" value={formatDuration(totals.restMinutes)} />
+          <div className="flex items-center gap-2 sm:gap-3">
+            <span className="min-w-0 flex-1 truncate text-xs text-slate-600 sm:text-sm">
+              {message ||
+                (isDirty
+                  ? `${dirtyDates.length} unsaved ${dirtyDates.length === 1 ? 'day' : 'days'}`
+                  : '')}
+            </span>
+
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={saving || !isDirty}
+              className="rounded-sm bg-emerald-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleReset}
+              disabled={saving || !isDirty}
+              className="rounded-sm border border-slate-300 px-4 py-1.5 text-sm font-medium hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Reset
+            </button>
           </div>
         </div>
-
-        <p className="mt-3 text-xs text-slate-500">
-          Drag across the graph to fill in work and rest. A drag does the opposite of
-          whatever you started on. Press Escape mid-drag to cancel.
-        </p>
       </div>
+
+      {loading && dates.every((date) => !days[date]) ? (
+        <p className="p-6 text-sm text-slate-500">Loading…</p>
+      ) : (
+        dates.map((date) => (
+          <TimelineDay
+            key={date}
+            date={date}
+            blocks={blocksFor(date)}
+            stroke={stroke?.date === date ? stroke : null}
+            ruleset={rulesets[date] ?? RULESETS[0]}
+            isDirty={dirtyDates.includes(date)}
+            onRulesetChange={handleRulesetChange}
+            onStrokeStart={handleStrokeStart}
+            onStrokeMove={handleStrokeMove}
+            onStrokeEnd={handleStrokeEnd}
+            onStrokeCancel={handleStrokeCancel}
+          />
+        ))
+      )}
+
+      <p className="mt-4 text-xs text-slate-500">
+        Drag across a graph to fill in work and rest. A drag does the opposite of whatever
+        you started on. Press Escape mid-drag to cancel.
+      </p>
     </section>
-  );
-}
-
-function Field({ label, value }) {
-  return (
-    <div className="flex flex-col gap-0.5">
-      <span className="text-[11px] leading-none text-slate-500">{label}</span>
-      <span className="text-sm font-medium">{value}</span>
-    </div>
-  );
-}
-
-function Total({ label, value }) {
-  return (
-    <div className="flex h-[30px] flex-col justify-center border-b border-slate-300 px-2 last:border-b-0">
-      <span className="text-[9px] leading-none text-slate-500">{label}</span>
-      <span className="mt-0.5 text-xs leading-none font-semibold tabular-nums">{value}</span>
-    </div>
   );
 }
